@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import time
+import threading
 import platform
 from pathlib import Path
 from datetime import datetime
@@ -23,7 +24,10 @@ except ImportError:
     print("[AIEngine] groq package not found. Run: pip install groq")
 
 try:
-    import google.generativeai as genai
+    import warnings as _warnings
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore", FutureWarning)
+        import google.generativeai as genai
     GEMINI_OK = True
 except ImportError:
     GEMINI_OK = False
@@ -328,6 +332,12 @@ class AIEngine:
         self._use_gemini = False
         self._init_client()
 
+        # Discover available Gemini models in the background so it never
+        # blocks startup (the network call can stall for many seconds on
+        # Windows 11 due to gRPC channel initialisation).
+        if self._enable_gemini and self._gemini_key:
+            threading.Thread(target=self._discover_gemini_models_bg, daemon=True).start()
+
     @staticmethod
     def _resolve_config_path() -> Path:
         if getattr(sys, "frozen", False):
@@ -423,10 +433,8 @@ ENABLE_COMMAND_EXECUTION = yes
             self._use_gemini and self._enable_gemini and self._gemini_key
         ):
             genai.configure(api_key=self._gemini_key)
-            if not self._gemini_models_discovered:
-                self._gemini_models = self._discover_gemini_models()
-                self._gemini_models_discovered = True
-                self._current_gemini_index = 0
+            # Discovery is deferred to a background thread (see __init__) to avoid
+            # blocking the main thread on Windows 11 during gRPC channel setup.
             model_name = self._gemini_models[self._current_gemini_index]
             self._client = genai.GenerativeModel(model_name)
             print(f"[AIEngine] Using Gemini / {model_name}")
@@ -439,10 +447,6 @@ ENABLE_COMMAND_EXECUTION = yes
         elif self._enable_gemini and self._gemini_key:
             self._use_gemini = True
             genai.configure(api_key=self._gemini_key)
-            if not self._gemini_models_discovered:
-                self._gemini_models = self._discover_gemini_models()
-                self._gemini_models_discovered = True
-                self._current_gemini_index = 0
             model_name = self._gemini_models[self._current_gemini_index]
             self._client = genai.GenerativeModel(model_name)
             print(f"[AIEngine] Using Gemini / {model_name}")
@@ -476,6 +480,17 @@ ENABLE_COMMAND_EXECUTION = yes
         except Exception as e:
             print(f"[AIEngine] Gemini discovery failed: {e}")
             return self._gemini_models
+
+    def _discover_gemini_models_bg(self) -> None:
+        """Run model discovery off the main thread, then update the client."""
+        discovered = self._discover_gemini_models()
+        self._gemini_models = discovered
+        self._gemini_models_discovered = True
+        self._current_gemini_index = 0
+        # Refresh the client only if we're currently using Gemini
+        if self._use_gemini and self._enable_gemini and self._gemini_key:
+            self._init_client()
+        print(f"[AIEngine] Gemini models discovered: {discovered[:3]}")
 
     def _rotate_key(self) -> bool:
         if not self._use_gemini:
