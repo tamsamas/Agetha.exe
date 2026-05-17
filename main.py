@@ -98,7 +98,11 @@ def _register_barrio_font():
             except Exception:
                 pass
             ctypes.windll.gdi32.AddFontResourceW(str(dest))
-            ctypes.windll.user32.SendMessageW(0xFFFF, 0x001D, 0, 0)
+            # SendMessageW broadcast to all windows can stall for several seconds
+            # on Windows 11 — run it in a daemon thread so it never blocks startup.
+            def _broadcast():
+                ctypes.windll.user32.SendMessageW(0xFFFF, 0x001D, 0, 0)
+            threading.Thread(target=_broadcast, daemon=True).start()
             print("[Font] Installed barrio.ttf to user fonts dir (Windows)")
             return True
     except Exception as e:
@@ -112,14 +116,31 @@ class BleepPlayer:
     SAMPLE_RATE = 44100
 
     def __init__(self):
-        pygame.mixer.pre_init(self.SAMPLE_RATE, -16, 1, 256)
-        pygame.mixer.init()
         self._stop_event = threading.Event()
         self._paused = False
         self._thread: threading.Thread | None = None
         self._cache: dict[int, pygame.mixer.Sound] = {}
+        self._mixer_ready = False
 
-    def _make_bleep(self, freq: int) -> pygame.mixer.Sound:
+        # Run pygame mixer init in a background thread — on Windows 11, SDL2's
+        # audio device enumeration can deadlock the main thread indefinitely.
+        t = threading.Thread(target=self._init_mixer, daemon=True)
+        t.start()
+        t.join(timeout=5.0)
+        if not self._mixer_ready:
+            print("[BleepPlayer] WARNING: pygame mixer init timed out — audio disabled.")
+
+    def _init_mixer(self):
+        try:
+            pygame.mixer.pre_init(self.SAMPLE_RATE, -16, 1, 256)
+            pygame.mixer.init()
+            self._mixer_ready = True
+        except Exception as e:
+            print(f"[BleepPlayer] mixer init error: {e}")
+
+    def _make_bleep(self, freq: int) -> "pygame.mixer.Sound | None":
+        if not self._mixer_ready:
+            return None
         if freq in self._cache:
             return self._cache[freq]
 
@@ -140,6 +161,8 @@ class BleepPlayer:
         return sound
 
     def start_talking(self, tone: str = "neutral"):
+        if not self._mixer_ready:
+            return
         self.stop()
         self._stop_event.clear()
         freq = BLEEP_TONES.get(tone, 440)
@@ -148,6 +171,8 @@ class BleepPlayer:
 
     def _loop(self, freq: int):
         sound = self._make_bleep(freq)
+        if sound is None:
+            return
         while not self._stop_event.is_set():
             if self._paused:
                 time.sleep(0.02)
