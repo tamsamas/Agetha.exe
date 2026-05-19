@@ -27,99 +27,48 @@ except ImportError:
 
 
 class _LocalOllamaClient:
-    """Minimal Ollama-compatible client wrapper.
+    """Minimal Ollama-compatible client wrapper using the Ollama REST API.
 
-    Tries, in order: `ollama` python package, HTTP local server, then `ollama` CLI.
-    Provides a compatible `.chat.completions.create(...)` used by the rest
-    of this file. Streaming is emulated by chunking the final text.
+    Calls http://localhost:11434 directly — the most reliable approach.
+    Provides a compatible `.chat.completions.create(...)` interface used by
+    the rest of this file. Streaming is emulated by chunking the final text.
     """
+    OLLAMA_URL = "http://localhost:11434/api/chat"
+
     def __init__(self, model: str, timeout: int = 30):
         self.model = model
         self.timeout = timeout
 
-    def _call_ollama_python(self, prompt: str) -> str:
-        try:
-            import ollama as _ollama
-            client = _ollama.Ollama()
-            out = client.generate(self.model, prompt)
-            if isinstance(out, dict):
-                return out.get("text") or out.get("content") or str(out)
-            return str(out)
-        except Exception:
-            raise
-
-    def _call_ollama_http(self, prompt: str) -> str:
-        try:
-            import requests
-            args = ["ollama", "generate", self.model, "--no-stream"]
-            # Pass prompt via stdin. On Windows, prevent a console window from appearing.
-            if platform.system() == "Windows":
-                si = subprocess.STARTUPINFO()
-                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                proc = subprocess.run(
-                    args,
-                    input=prompt,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout,
-                    startupinfo=si,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-            else:
-                proc = subprocess.run(args, input=prompt, capture_output=True, text=True, timeout=self.timeout)
-            resp.raise_for_status()
-            j = resp.json()
-            if isinstance(j, dict):
-                if "results" in j and j["results"]:
-                    first = j["results"][0]
-                    if isinstance(first, dict) and "content" in first and first["content"]:
-                        for c in first["content"]:
-                            if isinstance(c, dict) and c.get("type") in (None, "output_text"):
-                                return c.get("text") or c.get("content") or str(c)
-                return j.get("text") or j.get("content") or str(j)
-            return str(j)
-        except Exception:
-            raise
-
-    def _call_ollama_cli(self, prompt: str) -> str:
-        try:
-            args = ["ollama", "generate", self.model, "--no-stream"]
-            proc = subprocess.run(args, input=prompt, capture_output=True, text=True, timeout=self.timeout)
-            out = proc.stdout.strip()
-            if out:
-                return out
-            if proc.stderr:
-                return proc.stderr.strip()
-            return ""
-        except Exception:
-            raise
-
-    def _generate(self, prompt: str) -> str:
-        last = None
-        for fn in (self._call_ollama_python, self._call_ollama_http, self._call_ollama_cli):
-            try:
-                return fn(prompt)
-            except Exception as e:
-                last = e
-                continue
-        raise RuntimeError(f"All Ollama backends failed: {last}")
-
-    def chat(self):
-        # Provide an object compatible with usages in this file: self._client.chat.completions.create(...)
-        return SimpleNamespace(completions=self)
-
-    def create_completion_response(self, text: str):
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+    def _generate(self, messages: list) -> str:
+        import urllib.request, json as _json
+        payload = _json.dumps({
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            self.OLLAMA_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            body = resp.read().decode("utf-8")
+        j = _json.loads(body)
+        # Ollama /api/chat response: {"message": {"role": "assistant", "content": "..."}}
+        content = j.get("message", {}).get("content", "")
+        if not content:
+            content = j.get("response", "") or str(j)
+        return content.strip()
 
     def chat_completions_create(self, model=None, messages=None, temperature=0.7, max_tokens=400, top_p=0.95, timeout=None, stream=False):
-        prompt_parts = []
+        msgs = []
         if messages:
             for m in messages:
-                role = m.get("role") if isinstance(m, dict) else getattr(m, "role", "")
+                role    = m.get("role")    if isinstance(m, dict) else getattr(m, "role", "user")
                 content = m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
-                prompt_parts.append(f"{role}: {content}")
-        prompt = "\n\n".join(prompt_parts)
-        raw = self._generate(prompt)
+                msgs.append({"role": role, "content": content})
+        raw = self._generate(msgs)
         if raw is None:
             raw = ""
         if stream:
@@ -538,7 +487,7 @@ class AIEngine:
                 client = _LocalOllamaClient(local_model, timeout=int(self._config.get("LOCAL_AI_TIMEOUT", TIMEOUT)))
                 # Quick validation: try a short generate to ensure the model name is valid
                 try:
-                    test_resp = client._generate("Ping")
+                    test_resp = client._generate([{"role": "user", "content": "Ping"}])
                     if test_resp is None or not str(test_resp).strip():
                         raise RuntimeError("empty response from local AI")
                 except Exception as e:
