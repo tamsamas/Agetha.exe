@@ -336,42 +336,88 @@ class SubtitleRenderer:
         self._canvas.delete("all")
         cw = self._canvas.winfo_width()  or WINDOW_W
         ch = self._canvas.winfo_height() or 110
-
-        words   = text.split()
-        lines   = []
-        line    = ""
-        max_w   = cw - 24
-        char_w  = self._font_size * 0.62
-
-        for w in words:
-            test  = (line + " " + w).strip()
-            est_w = len(test) * char_w
-            if est_w > max_w and line:
-                lines.append(line)
-                line = w
+        max_w = max(40, cw - 24)
+        char_w = max(4, self._font_size * 0.62)
+        # break extremely long words so wrapping can occur
+        max_chars = max(8, int(max_w // char_w))
+        import re
+        parts = []
+        for w in re.split(r'(\s+)', text):
+            if w.isspace() or not w:
+                parts.append(w)
+                continue
+            if len(w) <= max_chars:
+                parts.append(w)
             else:
-                line = test
-        if line:
-            lines.append(line)
+                # chunk the long token into pieces with spaces between
+                chunks = [w[i:i+max_chars] for i in range(0, len(w), max_chars)]
+                parts.append(" ".join(chunks))
+        wrapped_text = "".join(parts).strip()
 
-        lines  = lines[-3:]
-        line_h = self._font_size + 7
-        total_h = len(lines) * line_h
-        y = max(6, (ch - total_h) // 2)
+        x = cw // 2
 
-        for ln in lines:
-            if color == "#ffffff":
-                self._canvas.create_text(
-                    cw // 2 + 2, y + 2,
-                    text=ln, fill="#000000",
-                    font=self._font, anchor="n"
-                )
-            self._canvas.create_text(
-                cw // 2, y,
-                text=ln, fill=color,
-                font=self._font, anchor="n"
-            )
-            y += line_h
+        # helper to create text, measure, and ensure max 3 lines by trimming leading words
+        def render_for(text_to_draw):
+            # draw shadow and main text, measure height
+            shadow_id = None
+            text_id = None
+            try:
+                shadow_id = self._canvas.create_text(x + 2, 6 + 2, text=text_to_draw, fill="#000000", font=self._font, anchor="n", width=max_w, justify="center")
+                text_id = self._canvas.create_text(x, 6, text=text_to_draw, fill=color, font=self._font, anchor="n", width=max_w, justify="center")
+                # force layout update to get bbox
+                try:
+                    self._canvas.update_idletasks()
+                except Exception:
+                    pass
+                bbox = self._canvas.bbox(text_id)
+                if not bbox:
+                    return shadow_id, text_id, 1
+                height = bbox[3] - bbox[1]
+                # estimate line count
+                line_h = self._font_size + 7
+                lines = max(1, int(math.ceil(height / line_h)))
+                return shadow_id, text_id, lines
+            except Exception:
+                # fallback: create single centered text
+                if text_id is None:
+                    text_id = self._canvas.create_text(x, 6, text=text_to_draw, fill=color, font=self._font, anchor="n")
+                return shadow_id, text_id, 1
+
+        words = wrapped_text.split()
+        if not words:
+            return
+
+        cur_words = words[:]
+        shadow_id = text_id = None
+        # Trim leading words until wrapped text fits within 3 lines (prefer showing newest content)
+        while cur_words:
+            candidate = " ".join(cur_words)
+            # clear temporary items before rendering attempt
+            self._canvas.delete("all")
+            shadow_id, text_id, lines = render_for(candidate)
+            if lines <= 3:
+                break
+            # drop the oldest word to show the most recent content
+            cur_words.pop(0)
+
+        if not text_id:
+            return
+
+        # center vertically based on actual bbox
+        try:
+            bbox = self._canvas.bbox(text_id)
+            if bbox:
+                height = bbox[3] - bbox[1]
+                y = max(6, (ch - height) // 2)
+                # update positions of both shadow and main text
+                try:
+                    if shadow_id:
+                        self._canvas.coords(shadow_id, x + 2, y + 2)
+                    self._canvas.coords(text_id, x, y)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 class AgethaPopup:
@@ -465,6 +511,7 @@ class CompanionApp:
         "angry":     "angry.gif",
         "thinking":  "thinking.gif",
         "sleeping":  "sleeping.gif",
+        "loaf":      "loaf.gif",
     }
 
     def __init__(self):
@@ -488,6 +535,8 @@ class CompanionApp:
         self._screen = ScreenReader()
         self._ai     = AIEngine()
         self._last_screen_text: str = ""
+        self._loaf_job = None
+        self._is_loafing = False
 
         self._build_ui()
         self._preload_gifs()
@@ -608,6 +657,20 @@ class CompanionApp:
             self._talking_rotate_job = None
 
     def _set_state(self, state: str, mood: str = "neutral"):
+        # Cancel any pending loaf timer when changing state
+        try:
+            if getattr(self, "_loaf_job", None):
+                self.root.after_cancel(self._loaf_job)
+                self._loaf_job = None
+        except Exception:
+            self._loaf_job = None
+        # If we were loafing, stop loaf state
+        try:
+            if getattr(self, "_is_loafing", False):
+                self._is_loafing = False
+        except Exception:
+            self._is_loafing = False
+
         self._state = state
         labels = {
             self.STATE_SLEEPING: "",
@@ -632,6 +695,11 @@ class CompanionApp:
                 available = [g for g in self.IDLE_GIFS if g in self._gif_cache]
                 if available:
                     self._play_gif(random.choice(available))
+            # Schedule loaf.gif after 15 minutes of idle
+            try:
+                self._loaf_job = self.root.after(15 * 60 * 1000, self._enter_loaf)
+            except Exception:
+                self._loaf_job = None
         elif state == self.STATE_TALKING:
             mood_gif = self.EXTRA_GIFS.get(mood)
             if mood_gif and mood_gif in self._gif_cache and mood != "neutral":
@@ -640,9 +708,18 @@ class CompanionApp:
                 self._start_talking_rotation()
             self._bleep.start_talking(tone=mood)
 
+    def _enter_loaf(self):
+        # Only enter loaf if still idle
+        try:
+            if self._state == self.STATE_IDLE and "loaf.gif" in self._gif_cache:
+                self._play_gif("loaf.gif")
+                self._is_loafing = True
+        except Exception:
+            pass
+
     def _start_wake_sequence(self):
         self._set_state(self.STATE_SLEEPING)
-        self.root.after(2500, self._finish_wake)
+        self.root.after(3500, self._finish_wake)
 
     def _finish_wake(self):
         self._set_state(self.STATE_IDLE, "neutral")
@@ -961,6 +1038,26 @@ class CompanionApp:
             self._reschedule_screen_poll()
             return
 
+        if command == "force_close":
+            target = (response.get("app", "") or response.get("process", "") or response.get("name", "")).strip()
+            if target:
+                try:
+                    import subprocess as _sp
+                    if platform.system() == "Windows":
+                        proc_name = os.path.basename(target)
+                        _sp.run(["taskkill", "/IM", proc_name, "/F"], capture_output=True, check=False)
+                    else:
+                        _sp.run(["pkill", "-f", target], check=False)
+                    print(f"[APP] Force-closed: {target}")
+                except Exception as e:
+                    print(f"[APP] Failed to force-close {target}: {e}")
+            else:
+                print("[APP] force_close: no target provided")
+            if not segments:
+                segments = [{"text": "Talk to me.", "pause": 0.0}]
+            _speak_and_continue(segments, mood, shutdown_requested)
+            return
+
         if command == "open_browser":
             url    = response.get("url",    "").strip()
             search = response.get("search", "").strip()
@@ -1062,23 +1159,41 @@ def _early_config_check():
     if config_path.exists():
         return  # Nothing to do
 
-    default_config = """# Agetha config file, set "USE_LOCAL_AI" to yes to enable local AI only
-USE_LOCAL_AI = no
-ENABLE_GROQ = yes
-GROQ_API_KEY = 
-GROQ_API_KEY_2 = 
-GROQ_API_KEY_3 = 
-GROQ_API_KEY_4 = 
-GROQ_API_KEY_5 = 
-GROQ_API_KEY_6 = 
-GROQ_API_KEY_7 = 
-GROQ_API_KEY_8 = 
-GROQ_API_KEY_9 = 
-GROQ_API_KEY_10 = 
-GROQ_MODEL = llama-3.3-70b-versatile
-LOCAL_AI_MODEL = 
-LOCAL_AI_TIMEOUT = 30
-ENABLE_COMMAND_EXECUTION = yes
+    default_config = """# Agetha version 3.1 config file, @tomiszivacs on TikTok
+    
+    # Set to "yes" to use a local AI model via Ollama instead of Groq. Make sure to set LOCAL_AI_MODEL if enabling.
+    USE_LOCAL_AI = no
+    
+    # Groq configuration (make sure to use separate accounts per key to avoid rate limits)
+    ENABLE_GROQ = yes
+    GROQ_API_KEY = 
+    GROQ_API_KEY_2 = 
+    GROQ_API_KEY_3 = 
+    GROQ_API_KEY_4 = 
+    GROQ_API_KEY_5 = 
+    GROQ_API_KEY_6 = 
+    GROQ_API_KEY_7 = 
+    GROQ_API_KEY_8 = 
+    GROQ_API_KEY_9 = 
+    GROQ_API_KEY_10 = 
+    # Groq model configuration, stupider models may have more forgiving rate limits.
+    GROQ_MODEL = llama-3.3-70b-versatile
+    
+    # Local AI configuration (using Ollama, make sure to have a compatible model downloaded)
+    LOCAL_AI_MODEL = 
+    LOCAL_AI_TIMEOUT = 30
+
+    # If you are unsure what to put here, run `ollama list` in a terminal to see installed models.
+    # If LOCAL_AI_MODEL is incorrect or the model isn't installed, Agetha will
+    # disable local AI and fall back (which can cause repeated idle responses).
+
+    # Let Agetha run commands on your machine?
+    ENABLE_COMMAND_EXECUTION = yes
+    
+    # How many characters of stored memories to include for Agetha? (The higher, the more context but also the more expensive the prompts)
+    MEMORY_CHARS = 600
+    # How many previous interactions to keep in history? (The higher, the more context but also the more expensive the prompts)
+    HISTORY_LIMIT = 6
 """
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(default_config, encoding="utf-8")
