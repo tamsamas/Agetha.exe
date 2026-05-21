@@ -296,11 +296,17 @@ class ScreenReader:
             screenshot = self.capture_image()
             if screenshot is None:
                 return ""
+            # Upscale 2x — Tesseract reads larger images much more accurately.
+            # (The old code halved the resolution, which caused garbled OCR output.)
             w, h = screenshot.size
-            screenshot = screenshot.resize((w // 2, h // 2), Image.LANCZOS)
+            screenshot = screenshot.resize((w * 2, h * 2), Image.LANCZOS)
+            # Grayscale removes color noise that confuses Tesseract
+            screenshot = screenshot.convert("L")
             text = pytesseract.image_to_string(screenshot, lang="eng", config="--psm 3")
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-            return "\n".join(lines)[:max_chars]
+            result = "\n".join(lines)[:max_chars]
+            print(f"[ScreenReader] Captured {len(result)} chars:\n{result}\n")
+            return result
         except Exception as e:
             print(f"[ScreenReader] OCR error: {e}")
             return ""
