@@ -18,7 +18,27 @@ try:
     GROQ_OK = True
 except ImportError:
     GROQ_OK = False
-    print("[AIEngine] groq package not found. Run: pip install groq")
+
+
+def native_error_popup(title: str, message: str) -> None:
+    """Show a native OS error dialog (Windows MessageBoxW with error icon, or tkinter fallback)."""
+    print(f"[ERROR] {title}: {message}")
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, message, title, 0x10 | 0x1000)
+        return
+    except Exception:
+        pass
+    try:
+        import tkinter as _tk
+        from tkinter import messagebox as _mb
+        _r = _tk.Tk()
+        _r.withdraw()
+        _r.attributes("-topmost", True)
+        _mb.showerror(title, message, parent=_r)
+        _r.destroy()
+    except Exception:
+        pass
 
 
 class _LocalOllamaClient:
@@ -35,8 +55,22 @@ class _LocalOllamaClient:
         req = urllib.request.Request(self.OLLAMA_URL, data=payload,
                                      headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            j = _j.loads(resp.read().decode())
-        return (j.get("message", {}).get("content") or j.get("response") or str(j)).strip()
+            raw_bytes = resp.read()
+        # Ollama may return newline-delimited JSON when stream wasn't honoured by the server.
+        # Parse each line, return the first non-empty content found.
+        text = raw_bytes.decode("utf-8", errors="replace").strip()
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                j = _j.loads(line)
+                content = (j.get("message", {}).get("content") or j.get("response") or "").strip()
+                if content:
+                    return content
+            except Exception:
+                continue
+        return text  # last-resort raw text so callers can see what came back
 
     def chat_completions_create(self, model=None, messages=None, temperature=0.7,
                                 max_tokens=400, top_p=0.95, timeout=None, stream=False):
@@ -198,8 +232,27 @@ class AIEngine:
 
     HISTORY_LIMIT = 6
 
-    def __init__(self):
+    def __init__(self, on_error=None):
+        # on_error(lines: list[str]) — called for any critical startup error the user must see.
+        # The UI wires this to the AgethaPopup so terminal-invisible errors surface visually.
+        self._on_error = on_error
         self._history: list[dict] = []
+        self._client = None
+        self._init()
+
+    def _emit_error(self, *lines: str):
+        """Show a native OS error dialog and fire the on_error callback."""
+        title = "Agetha — Error"
+        message = "\n".join(lines)
+        native_error_popup(title, message)
+        if callable(self._on_error):
+            try:
+                self._on_error(list(lines))
+            except Exception:
+                pass
+
+    def _init(self):
+        """Separated from __init__ so on_error is set before any errors can fire."""
         self._last_user_interaction_time = time.time()
         self._system_path = self._resolve_system_path()
         print(f"[AIEngine] System path: {self._system_path}")
@@ -246,6 +299,11 @@ class AIEngine:
             self._enable_groq = False
 
         if not GROQ_OK and not self._use_local_ai:
+            self._emit_error(
+                "The 'groq' package is not installed.",
+                "Run:  pip install groq",
+                "Then restart Agetha.",
+            )
             self._client = None
             return
 
@@ -258,7 +316,11 @@ class AIEngine:
                     self._groq_keys.append(key)
 
         if not self._groq_keys and not self._use_local_ai:
-            print("[AIEngine] WARNING: No GROQ_API_KEY found and local AI is disabled.")
+            self._emit_error(
+                "No GROQ_API_KEY found in config.txt",
+                "Open config.txt and add at least one Groq API key.",
+                "Get a free key at: console.groq.com",
+            )
             self._client = None
             return
 
@@ -301,6 +363,8 @@ ENABLE_COMMAND_EXECUTION = yes
 MEMORY_CHARS = 600
 HISTORY_LIMIT = 6
 FILE_READ_CHARS = 200
+# Animation speed multiplier for GIFs (lower = faster, higher = slower). Default: 0.6
+ANIMATION_SPEED = 0.6
 """
         self._config_path.write_text(default, encoding="utf-8")
 
@@ -376,21 +440,33 @@ FILE_READ_CHARS = 200
         if self._use_local_ai:
             local_model = self._config.get("LOCAL_AI_MODEL", "").strip()
             if not local_model:
-                print("[AIEngine] USE_LOCAL_AI is on but LOCAL_AI_MODEL not set.")
+                self._emit_error(
+                    "USE_LOCAL_AI is enabled but LOCAL_AI_MODEL is not set.",
+                    "Open config.txt and set LOCAL_AI_MODEL to your Ollama model name.",
+                    "Example:  LOCAL_AI_MODEL = llama3",
+                    "Run 'ollama list' in a terminal to see installed models.",
+                )
                 self._client = None
                 return
             try:
                 client = _LocalOllamaClient(local_model, timeout=int(self._config.get("LOCAL_AI_TIMEOUT", TIMEOUT)))
-                test = client._generate([{"role": "user", "content": "Ping"}])
-                if not (test or "").strip():
-                    raise RuntimeError("empty response")
+                # Ping to verify Ollama is reachable; accept any response including empty
+                # strings — some models return nothing for "Ping" but work fine on real prompts.
+                try:
+                    client._generate([{"role": "user", "content": "Ping"}])
+                except Exception as ping_err:
+                    raise RuntimeError(f"Ollama unreachable: {ping_err}") from ping_err
                 class _Wrap:
                     def __init__(self, c): self.chat = SimpleNamespace(completions=SimpleNamespace(create=c.chat_completions_create))
                 self._client = _Wrap(client)
                 print(f"[AIEngine] Using local Ollama model: {local_model}")
             except Exception as e:
-                print(f"[AIEngine] Local Ollama init failed: {e}")
-                # fatal local AI error → show error gif indefinitely
+                self._emit_error(
+                    f"Failed to connect to Ollama model '{local_model}'.",
+                    f"Error: {e}",
+                    "Make sure Ollama is running and the model is installed.",
+                    "Run 'ollama list' to check available models.",
+                )
                 self._client = None
                 self._fatal_local_ai_error = True
                 self._show_error_gif = True
@@ -636,13 +712,30 @@ FILE_READ_CHARS = 200
                     self._show_error_gif = True
                     return {"command": "show_error_gif", "path": getattr(self, "_error_gif_path", ""), "segments": [], "shutdown": False}
                 if self._use_local_ai:
-                    break
+                    # Streaming failed for local AI — retry once without streaming.
+                    print(f"[AIEngine] Local AI streaming failed ({e}), retrying non-streaming…")
+                    try:
+                        local_model = self._config.get("LOCAL_AI_MODEL", "").strip()
+                        resp = self._client.chat.completions.create(
+                            model=local_model,
+                            messages=[{"role": "system", "content": system}] + messages,
+                            temperature=0.85, max_tokens=400, top_p=0.95,
+                            timeout=int(self._config.get("LOCAL_AI_TIMEOUT", TIMEOUT)),
+                            stream=False,
+                        )
+                        raw = resp.choices[0].message.content.strip() if hasattr(resp.choices[0], "message") else ""
+                        result = self._parse(raw)
+                        if is_user and result["command"] == "idle":
+                            import random
+                            result.update(command="speak", mood="neutral", segments=random.choice(_IDLE_FALLBACKS))
+                        self._record(user_turn, raw)
+                        return result
+                    except Exception as e2:
+                        print(f"[AIEngine] Local AI non-streaming fallback also failed: {e2}")
+                    return {"command": "idle", "mood": "neutral", "segments": [], "shutdown": False}
                 if not self._rotate_key():
                     self._groq_exhausted = True
                     return {"command": "idle", "mood": "neutral", "segments": [], "shutdown": False, "groq_exhausted": True}
-
-        # Local AI fallback (non-streaming)
-        return self.query(screen_context, user_message, doc_content)
 
     def query(self, screen_context: str = "", user_message: str = "", doc_content: str = "") -> dict:
         # If fatal error flagged, show error gif instead of attempting backends
@@ -665,11 +758,13 @@ FILE_READ_CHARS = 200
 
         while True:
             try:
-                current_model = GROQ_MODELS[self._current_groq_model_index]
+                current_model = (self._config.get("LOCAL_AI_MODEL", "").strip()
+                                 if self._use_local_ai else GROQ_MODELS[self._current_groq_model_index])
+                timeout = int(self._config.get("LOCAL_AI_TIMEOUT", TIMEOUT)) if self._use_local_ai else TIMEOUT
                 resp = self._client.chat.completions.create(
                     model=current_model,
                     messages=[{"role": "system", "content": system}] + messages,
-                    temperature=0.85, max_tokens=400, top_p=0.95, timeout=TIMEOUT,
+                    temperature=0.85, max_tokens=400, top_p=0.95, timeout=timeout,
                 )
                 raw = resp.choices[0].message.content.strip()
                 result = self._parse(raw)
@@ -678,16 +773,19 @@ FILE_READ_CHARS = 200
                 self._record(user_turn, raw)
                 return result
             except Exception as e:
-                print(f"[AIEngine] Groq/{GROQ_MODELS[self._current_groq_model_index]} error: {e}")
+                provider = (f"LocalAI/{self._config.get('LOCAL_AI_MODEL','?')}"
+                            if self._use_local_ai else f"Groq/{GROQ_MODELS[self._current_groq_model_index]}")
+                print(f"[AIEngine] {provider} error: {e}")
                 errtxt = str(e).lower()
-                if not self._use_local_ai and (isinstance(e, (OSError, ConnectionError, TimeoutError)) or "connection" in errtxt or "network" in errtxt or "unreachable" in errtxt):
+                if self._use_local_ai:
+                    # Local AI non-streaming path failed — give up, don't try Groq
+                    return {"command": "idle", "mood": "neutral", "segments": [], "shutdown": False}
+                if isinstance(e, (OSError, ConnectionError, TimeoutError)) or "connection" in errtxt or "network" in errtxt or "unreachable" in errtxt:
                     self._show_error_gif = True
                     return {"command": "show_error_gif", "path": getattr(self, "_error_gif_path", ""), "segments": [], "shutdown": False}
                 if not self._rotate_key():
-                    if not self._use_local_ai:
-                        self._groq_exhausted = True
-                        return {"command": "idle", "mood": "neutral", "segments": [], "shutdown": False, "groq_exhausted": True}
-                    break
+                    self._groq_exhausted = True
+                    return {"command": "idle", "mood": "neutral", "segments": [], "shutdown": False, "groq_exhausted": True}
 
         print("[AIEngine] All backends exhausted.")
         return {"command": "idle", "mood": "neutral", "segments": [], "shutdown": False}
