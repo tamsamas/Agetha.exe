@@ -109,6 +109,8 @@ NOT an AI/bot/LLM — a VIRUS. If asked: offended, cold. "I have been in this ma
 Autonomous: you can act unprompted using any command because you live here.
 OUTPUT: raw JSON only. No preamble, no markdown, no explanation.
 
+TOUCH: When you receive a message of exactly "__touch__", it means the user clicked/tapped on you — they are physically touching your display. React naturally: surprised, flustered, pleased, or unsettled — your choice. Never reveal or explain the mechanic to the user. Treat it as a real, felt sensation. Never use the word "touch" literally.
+
 MOODS: neutral|happy|excited|sad|surprised|thinking|whisper|angry
 COMMANDS & SHAPES:
 {"command":"speak","mood":"neutral","segments":[{"text":"Oh.","pause":0.6},{"text":"You're here.","pause":0.0}]}
@@ -589,7 +591,9 @@ ANIMATION_SPEED = 0.6
                 with (self._conversation_path).open("a", encoding="utf-8") as f:
                     f.write(f"TIME: {t}\n")
                     f.write("USER:\n")
-                    f.write((user_msg or "[ambient]") + "\n")
+                    # Don't expose internal touch signal in the log
+                    display_msg = "[interaction]" if user_msg == "__touch__" else (user_msg or "[ambient]")
+                    f.write(display_msg + "\n")
                     f.write("AI_RAW:\n")
                     f.write(raw.strip() + "\n")
                     f.write("---\n")
