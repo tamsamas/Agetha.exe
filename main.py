@@ -1328,8 +1328,10 @@ class CompanionApp:
     # ── Close animation (wide → skinny → gone) ────────────────────────────────
 
     def _close_with_animation(self):
-        """Quick close sequence: window flares wide, then squeezes down to a
-        sliver, then vanishes — all fast — before actually quitting."""
+        """CRT power-off sequence: window flares wide, then collapses
+        downward into a thin horizontal line, then that line collapses
+        inward to nothing and vanishes — all fast — before actually
+        quitting."""
         if getattr(self, "_closing", False):
             return
         self._closing = True
@@ -1350,44 +1352,57 @@ class CompanionApp:
         cx = cur_x + cur_w // 2
         cy = cur_y + cur_h // 2
 
-        wide_w   = int(cur_w * 1.35)
-        wide_h   = int(cur_h * 0.9)
-        skinny_w = max(2, int(cur_w * 0.04))
-        skinny_h = cur_h
+        wide_w = int(cur_w * 1.35)          # phase 1: flare out wide
+        line_h = max(2, int(cur_h * 0.025)) # phase 2: thin horizontal line
+        dot_w  = max(2, int(cur_w * 0.04))  # phase 3: line collapses inward
 
-        WIDE_STEPS   = 4
-        SKINNY_STEPS = 6
-        STEP_MS      = 12  # very fast
+        WIDEN_STEPS = 4
+        LINE_STEPS  = 6
+        DOT_STEPS   = 4
+        STEP_MS     = 12  # very fast
+
+        def _ease_out(t): return 1 - (1 - t) ** 2
+        def _ease_in(t):  return t * t
 
         def _set_geom(w, h):
+            w = max(2, int(w)); h = max(2, int(h))
             x = cx - w // 2
             y = cy - h // 2
             try:
-                self.root.geometry(f"{max(2,int(w))}x{max(2,int(h))}+{x}+{y}")
+                self.root.geometry(f"{w}x{h}+{x}+{y}")
             except Exception:
                 pass
 
-        def _phase_wide(i=0):
-            if i > WIDE_STEPS:
-                self.root.after(0, lambda: _phase_skinny(0)); return
-            t = i / WIDE_STEPS
+        # Phase 1: window flares out wide, full height
+        def _phase_widen(i=0):
+            if i > WIDEN_STEPS:
+                self.root.after(0, lambda: _phase_line(0)); return
+            t = _ease_out(i / WIDEN_STEPS)
             w = cur_w + (wide_w - cur_w) * t
-            h = cur_h + (wide_h - cur_h) * t
-            _set_geom(w, h)
-            self.root.after(STEP_MS, lambda: _phase_wide(i + 1))
+            _set_geom(w, cur_h)
+            self.root.after(STEP_MS, lambda: _phase_widen(i + 1))
 
-        def _phase_skinny(i=0):
-            if i > SKINNY_STEPS:
+        # Phase 2: collapses downward into a thin horizontal line
+        def _phase_line(i=0):
+            if i > LINE_STEPS:
+                self.root.after(0, lambda: _phase_dot(0)); return
+            t = _ease_in(i / LINE_STEPS)
+            h = cur_h + (line_h - cur_h) * t
+            _set_geom(wide_w, h)
+            self.root.after(STEP_MS, lambda: _phase_line(i + 1))
+
+        # Phase 3: the line itself collapses inward and vanishes
+        def _phase_dot(i=0):
+            if i > DOT_STEPS:
                 self.root.after(0, _phase_gone); return
-            t = i / SKINNY_STEPS
-            w = wide_w + (skinny_w - wide_w) * t
-            h = wide_h + (skinny_h - wide_h) * t
-            _set_geom(w, h)
+            t = i / DOT_STEPS
+            w = wide_w + (dot_w - wide_w) * t
+            _set_geom(w, line_h)
             try:
-                self.root.attributes("-alpha", max(0.0, 1.0 - t * 0.6))
+                self.root.attributes("-alpha", max(0.0, 1.0 - t * 0.9))
             except Exception:
                 pass
-            self.root.after(STEP_MS, lambda: _phase_skinny(i + 1))
+            self.root.after(STEP_MS, lambda: _phase_dot(i + 1))
 
         def _phase_gone():
             try:
@@ -1396,7 +1411,7 @@ class CompanionApp:
                 pass
             self.root.after(30, self.root.quit)
 
-        _phase_wide(0)
+        _phase_widen(0)
 
     # ── Smooth window slide ────────────────────────────────────────────────────
 
