@@ -1,10 +1,15 @@
 """
-Desktop AI Companion — Agetha v5
+Desktop AI Companion — Agetha v5.0.2
 Requires: pip install pillow pyautogui pytesseract numpy pygame requests pywin32 SpeechRecognition pyaudio
 Assets: idle-1..3.gif, talking-1..3.gif, thinking.gif, sleeping.gif, happy.gif, surprised.gif,
         sad.gif, angry.gif, happy-static.gif, sad-static.gif, angry-static.gif, thinking-static.gif,
         loaf.gif, barrio.ttf (all in assets/ folder)
 """
+
+AGETHA_VERSION = "5.0.2"
+# Join the Discord — also linked in the TikTok bio and on the website below.
+DISCORD_INVITE_URL = "https://discord.gg/agetha"
+AGETHA_WEBSITE_URL = "https://chocolatebread.ddns.net/agetha.html"
 
 import tkinter as tk
 from tkinter import font as tkfont
@@ -508,6 +513,24 @@ def _read_local_stt() -> bool:
 
 _USE_LOCAL_STT = _read_local_stt()
 
+
+def _read_show_mic_button() -> bool:
+    try:
+        _base = Path(sys.argv[0]).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).parent
+        _cfg = _base / "config.txt"
+        if _cfg.exists():
+            for ln in _cfg.read_text(encoding="utf-8", errors="replace").splitlines():
+                s = ln.strip()
+                if s.startswith("#") or "=" not in s: continue
+                k, v = s.split("=", 1)
+                if k.strip().upper() == "SHOW_MIC_BUTTON":
+                    return v.strip().lower() in ("yes", "true", "1", "on")
+    except Exception:
+        pass
+    return True  # enabled by default
+
+_SHOW_MIC_BUTTON = _read_show_mic_button()
+
 # Lazy-load faster-whisper model once
 _whisper_model = None
 _whisper_lock  = threading.Lock()
@@ -990,6 +1013,23 @@ class CompanionApp:
         self._load_pct_var = tk.StringVar(value="0%")
         tk.Label(self._loading_label, textvariable=self._load_pct_var,
                  fg=W95_TEXT, bg=W95_BG, font=W95_FONT).pack()
+
+        # Discord / community links — shown while loading
+        _link_frame = tk.Frame(self._loading_label, bg=W95_BG)
+        _link_frame.pack(pady=(10, 0))
+        _discord_lbl = tk.Label(_link_frame, text="Join the Discord server!",
+                                 fg=W95_TITLE_BG, bg=W95_BG, font=("MS Sans Serif", 7, "underline"),
+                                 cursor="hand2")
+        _discord_lbl.pack()
+        _discord_lbl.bind("<Button-1>", lambda e: webbrowser.open(DISCORD_INVITE_URL))
+        tk.Label(_link_frame, text="(link in TikTok bio, or the website below)",
+                 fg=W95_SHADOW, bg=W95_BG, font=("MS Sans Serif", 6)).pack()
+        _site_lbl = tk.Label(_link_frame, text=AGETHA_WEBSITE_URL,
+                              fg=W95_TITLE_BG, bg=W95_BG, font=("MS Sans Serif", 6, "underline"),
+                              cursor="hand2")
+        _site_lbl.pack(pady=(2, 0))
+        _site_lbl.bind("<Button-1>", lambda e: webbrowser.open(AGETHA_WEBSITE_URL))
+
         self._load_total = 3; self._load_done = 0
 
         def _draw_progress():
@@ -1027,6 +1067,8 @@ class CompanionApp:
         except Exception:
             pass
 
+        self._show_desktop_loading_indicator()
+
         threading.Thread(target=self._init_background, daemon=True).start()
         self._drag_x = self._drag_y = 0
         self._is_minimized = False
@@ -1054,7 +1096,7 @@ class CompanionApp:
         self._close_btn = tk.Button(title_bar, text="✕", bg=W95_BTN_BG, fg=W95_TEXT,
                   font=("MS Sans Serif", 7, "bold"), relief="raised", bd=2, width=2,
                   activebackground=W95_BTN_BG, activeforeground=W95_TEXT,
-                  command=self.root.quit)
+                  command=self._close_with_animation)
         self._close_btn.pack(side="right", padx=(0, 2), pady=1)
         self._close_btn.bind("<Enter>", self._on_close_hover)
         self._close_btn.bind("<Leave>", self._on_close_leave)
@@ -1069,8 +1111,13 @@ class CompanionApp:
             w.bind("<B1-Motion>",     self._drag_motion)
 
         # GIF area
-        gif_border = tk.Frame(self._outer, bg="#000000", relief="raised", bd=2)
+        gif_border = tk.Frame(self._outer, bg="#000000", relief="raised", bd=2, highlightthickness=2,
+                              highlightbackground="#000000", highlightcolor="#000000")
         gif_border.pack(fill="x", padx=4, pady=(4, 0))
+        self._gif_border = gif_border
+        self._glow_phase = 0.0
+        self._glow_mood  = "neutral"
+        self._glow_active = False
         self._gif_label = tk.Label(gif_border, bg="#000000", bd=0,
                                    width=GIF_W, height=GIF_H, anchor="center")
         self._gif_label.pack(fill="both", expand=True)
@@ -1135,14 +1182,15 @@ class CompanionApp:
 
         self._input_box.bind("<Return>", self._on_user_input)
 
-        # Mic toggle button (🎤 / 🔴)
+        # Mic toggle button (🎤 / 🔴) — hidden entirely if SHOW_MIC_BUTTON = no
         self._mic_btn_var = tk.StringVar(value="🎤")
         self._mic_btn = tk.Button(input_frame, textvariable=self._mic_btn_var,
                                   font=W95_FONT_BOLD, bg=W95_BTN_BG, fg=W95_TEXT,
                                   activebackground=W95_BTN_ACT, activeforeground=W95_BTN_AFG,
                                   relief="raised", bd=2, padx=6, pady=5,
                                   command=self._toggle_mic)
-        self._mic_btn.pack(side="left", padx=(2, 0))
+        if _SHOW_MIC_BUTTON:
+            self._mic_btn.pack(side="left", padx=(2, 0))
 
         # Send button
         tk.Button(input_frame, text="OK", font=W95_FONT_BOLD,
@@ -1276,6 +1324,79 @@ class CompanionApp:
                     pass
             self.root.bind("<Map>", _on_map)
         self.root.after(250, _bind_restore)
+
+    # ── Close animation (wide → skinny → gone) ────────────────────────────────
+
+    def _close_with_animation(self):
+        """Quick close sequence: window flares wide, then squeezes down to a
+        sliver, then vanishes — all fast — before actually quitting."""
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+
+        try:
+            self._stop_talking_rotation()
+        except Exception:
+            pass
+
+        try:
+            cur_x = self.root.winfo_x()
+            cur_y = self.root.winfo_y()
+            cur_w = self.root.winfo_width()  or WINDOW_W
+            cur_h = self.root.winfo_height() or WINDOW_H
+        except Exception:
+            self.root.quit(); return
+
+        cx = cur_x + cur_w // 2
+        cy = cur_y + cur_h // 2
+
+        wide_w   = int(cur_w * 1.35)
+        wide_h   = int(cur_h * 0.9)
+        skinny_w = max(2, int(cur_w * 0.04))
+        skinny_h = cur_h
+
+        WIDE_STEPS   = 4
+        SKINNY_STEPS = 6
+        STEP_MS      = 12  # very fast
+
+        def _set_geom(w, h):
+            x = cx - w // 2
+            y = cy - h // 2
+            try:
+                self.root.geometry(f"{max(2,int(w))}x{max(2,int(h))}+{x}+{y}")
+            except Exception:
+                pass
+
+        def _phase_wide(i=0):
+            if i > WIDE_STEPS:
+                self.root.after(0, lambda: _phase_skinny(0)); return
+            t = i / WIDE_STEPS
+            w = cur_w + (wide_w - cur_w) * t
+            h = cur_h + (wide_h - cur_h) * t
+            _set_geom(w, h)
+            self.root.after(STEP_MS, lambda: _phase_wide(i + 1))
+
+        def _phase_skinny(i=0):
+            if i > SKINNY_STEPS:
+                self.root.after(0, _phase_gone); return
+            t = i / SKINNY_STEPS
+            w = wide_w + (skinny_w - wide_w) * t
+            h = wide_h + (skinny_h - wide_h) * t
+            _set_geom(w, h)
+            try:
+                self.root.attributes("-alpha", max(0.0, 1.0 - t * 0.6))
+            except Exception:
+                pass
+            self.root.after(STEP_MS, lambda: _phase_skinny(i + 1))
+
+        def _phase_gone():
+            try:
+                self.root.attributes("-alpha", 0.0)
+            except Exception:
+                pass
+            self.root.after(30, self.root.quit)
+
+        _phase_wide(0)
 
     # ── Smooth window slide ────────────────────────────────────────────────────
 
@@ -1672,6 +1793,53 @@ class CompanionApp:
         except Exception as e:
             print(f"[Token Status] Error: {e}")
 
+    # ── Reactive glow effect (eye-candy) ───────────────────────────────────────
+    # A soft pulsing colored border around the GIF frame that reacts to mood/state,
+    # making Agetha feel more alive/reactive at a glance.
+
+    _GLOW_COLORS = {
+        "neutral":   "#4488cc",
+        "happy":     "#ffd24d",
+        "excited":   "#ff9d1a",
+        "sad":       "#5566aa",
+        "surprised": "#cc66ff",
+        "thinking":  "#33cccc",
+        "whisper":   "#8899aa",
+        "angry":     "#ff3b3b",
+        "sleeping":  "#222233",
+    }
+
+    @staticmethod
+    def _lerp_color(c1: str, c2: str, t: float) -> str:
+        c1 = c1.lstrip("#"); c2 = c2.lstrip("#")
+        r1, g1, b1 = int(c1[0:2], 16), int(c1[2:4], 16), int(c1[4:6], 16)
+        r2, g2, b2 = int(c2[0:2], 16), int(c2[2:4], 16), int(c2[4:6], 16)
+        r = int(r1 + (r2 - r1) * t); g = int(g1 + (g2 - g1) * t); b = int(b1 + (b2 - b1) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _set_glow_mood(self, mood: str):
+        self._glow_mood = mood if mood in self._GLOW_COLORS else "neutral"
+        if not self._glow_active:
+            self._glow_active = True
+            self._glow_tick()
+
+    def _glow_tick(self):
+        if not getattr(self, "_glow_active", False):
+            return
+        try:
+            base = self._GLOW_COLORS.get(self._glow_mood, "#4488cc")
+            # breathing pulse: oscillate brightness via lerp toward black/white
+            self._glow_phase += 0.12
+            pulse = (math.sin(self._glow_phase) + 1) / 2  # 0..1
+            speed_boost = 1.0 if self._state != self.STATE_TALKING else 1.8
+            self._glow_phase += 0.0  # (kept for clarity; speed applied via increment below)
+            lit_color = self._lerp_color("#000000", base, 0.35 + pulse * 0.65)
+            self._gif_border.configure(highlightbackground=lit_color, highlightcolor=lit_color)
+        except Exception:
+            pass
+        interval = 55 if self._state == self.STATE_TALKING else 90
+        self.root.after(interval, self._glow_tick)
+
     def _set_state(self, state: str, mood: str = "neutral"):
         # Cancel loaf timer on any state change
         try:
@@ -1698,14 +1866,17 @@ class CompanionApp:
         if state == self.STATE_SLEEPING:
             self._persistent_mood = None
             self._play_gif("sleeping.gif")
+            self._set_glow_mood("sleeping")
 
         elif state == self.STATE_THINKING:
             self._persistent_mood = None
             self._play_gif_once_then("thinking.gif", "thinking-static.gif",
                                      guard=lambda: self._state == self.STATE_THINKING)
+            self._set_glow_mood("thinking")
 
         elif state == self.STATE_IDLE:
             effective_mood = self._persistent_mood if self._persistent_mood else mood
+            self._set_glow_mood(effective_mood)
             static_name = None
             try: static_name = self.EXTRA_STATIC_GIFS.get(effective_mood)
             except Exception: pass
@@ -1723,6 +1894,10 @@ class CompanionApp:
         elif state == self.STATE_TALKING:
             if mood in _STICKY_MOODS: self._persistent_mood = mood
             else: self._persistent_mood = None
+            self._set_glow_mood(mood)
+            if mood in ("excited", "surprised", "angry", "happy"):
+                try: self._bounce_window()
+                except Exception: pass
             mood_gif    = self.EXTRA_GIFS.get(mood)
             static_name = self.EXTRA_STATIC_GIFS.get(mood)
             if mood != "neutral" and mood_gif and mood_gif in self._gif_cache:
@@ -1843,7 +2018,57 @@ class CompanionApp:
             except Exception: _finish()
         except Exception as e:
             print(f"[BackgroundInit] Unexpected error: {e}")
+            try: self.root.after(0, self._hide_desktop_loading_indicator)
+            except Exception: pass
             native_error_popup("Agetha — Unexpected Error", f"Unexpected startup error:\n{e}")
+
+    def _show_desktop_loading_indicator(self):
+        """Show thinking-static.gif pinned to the bottom-right corner of the
+        DESKTOP (not Agetha's window) while the program is loading."""
+        self._desktop_loading_win = None
+        try:
+            gif_path = ASSETS / "thinking-static.gif"
+            if not gif_path.exists():
+                print(f"[LoadingIndicator] Missing asset: {gif_path}")
+                return
+
+            img = Image.open(gif_path).convert("RGBA")
+            img.thumbnail((96, 96), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            try:
+                win.attributes("-transparentcolor", "#010101")
+                win.configure(bg="#010101")
+                bg = "#010101"
+            except Exception:
+                win.configure(bg=W95_BG)
+                bg = W95_BG
+
+            lbl = tk.Label(win, image=photo, bg=bg, bd=0)
+            lbl.image = photo  # keep reference
+            lbl.pack()
+
+            win.update_idletasks()
+            sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
+            ww = img.width; wh = img.height
+            margin = 12
+            x = sw - ww - margin
+            y = sh - wh - margin
+            win.geometry(f"{ww}x{wh}+{x}+{y}")
+
+            self._desktop_loading_win = win
+        except Exception as e:
+            print(f"[LoadingIndicator] Failed to show desktop indicator: {e}")
+
+    def _hide_desktop_loading_indicator(self):
+        win = getattr(self, "_desktop_loading_win", None)
+        if win is not None:
+            try: win.destroy()
+            except Exception: pass
+            self._desktop_loading_win = None
 
     def _preload_gifs(self):
         static_vals = list(self.EXTRA_STATIC_GIFS.values()) if getattr(self, 'EXTRA_STATIC_GIFS', None) else []
@@ -1908,6 +2133,10 @@ class CompanionApp:
                 if hasattr(self, "_loading_label") and self._loading_label:
                     self._loading_label.destroy()
                     self._loading_label = None
+            except Exception:
+                pass
+            try:
+                self._hide_desktop_loading_indicator()
             except Exception:
                 pass
             try:
@@ -2458,7 +2687,7 @@ class CompanionApp:
             self.root.after_cancel(self._poll_job)
             self._poll_job = None
         if self._voice: self._voice.stop()
-        self.root.quit()
+        self._close_with_animation()
 
     def run(self):
         try:
@@ -2499,7 +2728,7 @@ def _early_config_check():
     if config_path.exists():
         return
 
-    default_config = """# Agetha v5.0.1 config — @tomiszivacs on TikTok
+    default_config = """# Agetha v5.0.2 config — @tomiszivacs on TikTok
 
 # Set to "yes" to use Ollama instead of Groq.
 USE_LOCAL_AI = no
@@ -2547,6 +2776,9 @@ ANIMATION_SPEED = 0.6
 # OCR: capture only the focused/foreground window (yes) or full screen (no).
 # yes = faster, more relevant; no = captures everything visible
 OCR_FOCUSED_WINDOW = false
+
+# Show the microphone button next to the input box? Set to "no" to hide it.
+SHOW_MIC_BUTTON = yes
 
 # FASTER_MODE: removes character awareness and personality details to save tokens.
 # Agetha will respond correctly to commands but with less personality.
