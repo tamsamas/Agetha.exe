@@ -147,9 +147,188 @@ class _OpenRouterClient:
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
 
+class _GeminiClient:
+    """Minimal Google Gemini (https://ai.google.dev) chat client.
+
+    Mimics the small subset of the OpenAI-style client interface used
+    elsewhere in this file (chat.completions.create), including streaming,
+    so it's a drop-in alongside Groq/OpenRouter/Ollama.
+    """
+
+    API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
+    def __init__(self, api_key: str, model: str, timeout: int = 30):
+        self.api_key = api_key
+        self.model = model
+        self.timeout = timeout
+
+    @staticmethod
+    def _to_gemini_payload(messages: list) -> tuple[str, list]:
+        """Splits OpenAI-style messages into (system_text, gemini_contents).
+
+        Gemini has no "system" role — system content is sent separately via
+        system_instruction, and assistant turns use role "model" not
+        "assistant".
+        """
+        system_parts = []
+        contents = []
+        for m in messages or []:
+            role = m.get("role") if isinstance(m, dict) else getattr(m, "role", "user")
+            content = m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
+            if role == "system":
+                if content: system_parts.append(str(content))
+                continue
+            gemini_role = "model" if role == "assistant" else "user"
+            contents.append({"role": gemini_role, "parts": [{"text": str(content)}]})
+        return "\n\n".join(system_parts), contents
+
+    def chat_completions_create(self, model=None, messages=None, temperature=0.7,
+                                max_tokens=400, top_p=0.95, timeout=None, stream=False):
+        import urllib.request, json as _j
+
+        mdl = model or self.model
+        system_text, contents = self._to_gemini_payload(messages)
+
+        payload = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+                "topP": top_p,
+            },
+        }
+        if system_text:
+            payload["system_instruction"] = {"parts": [{"text": system_text}]}
+
+        to = timeout or self.timeout
+
+        if stream:
+            url = f"{self.API_BASE}/{mdl}:streamGenerateContent?alt=sse&key={self.api_key}"
+            req = urllib.request.Request(
+                url, data=_j.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            def _gen():
+                with urllib.request.urlopen(req, timeout=to) as resp:
+                    for line_bytes in resp:
+                        line = line_bytes.decode("utf-8", errors="replace").strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[len("data:"):].strip()
+                        if not data_str or data_str == "[DONE]":
+                            continue
+                        try:
+                            chunk = _j.loads(data_str)
+                        except Exception:
+                            continue
+                        try:
+                            text = chunk["candidates"][0]["content"]["parts"][0].get("text", "")
+                        except (KeyError, IndexError, TypeError):
+                            text = ""
+                        usage_meta = chunk.get("usageMetadata")
+                        ns_usage = None
+                        if isinstance(usage_meta, dict):
+                            ns_usage = SimpleNamespace(
+                                prompt_tokens=usage_meta.get("promptTokenCount"),
+                                completion_tokens=usage_meta.get("candidatesTokenCount"),
+                                total_tokens=usage_meta.get("totalTokenCount"),
+                            )
+                        yield SimpleNamespace(
+                            choices=[SimpleNamespace(delta=SimpleNamespace(content=text))],
+                            usage=ns_usage,
+                        )
+            return _gen()
+
+        url = f"{self.API_BASE}/{mdl}:generateContent?key={self.api_key}"
+        req = urllib.request.Request(
+            url, data=_j.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=to) as resp:
+            raw_bytes = resp.read()
+        obj = _j.loads(raw_bytes.decode("utf-8", errors="replace"))
+        try:
+            content = obj["candidates"][0]["content"]["parts"][0].get("text", "")
+        except (KeyError, IndexError, TypeError):
+            content = ""
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+
 CONFIG_FILE_NAME = "config.txt"
-GROQ_MODELS = ["llama-3.3-70b-versatile"]
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 TIMEOUT = 30
+DEFAULT_MAX_TOKENS = 800
+DEFAULT_REASONING_EFFORT = "low"
+
+# ── Canonical config.txt template ──────────────────────────────────────────────
+# Single source of truth for a brand-new config.txt AND for auto-upgrading an
+# existing one: any KEY present here but missing from the user's config.txt
+# gets appended automatically (see _load_config / _append_missing_config_keys).
+DEFAULT_CONFIG_TEMPLATE = """\
+# Agetha v5.0.3 config
+
+# Only ONE of Groq / Gemini / OpenRouter / local Ollama is ever active.
+# Priority when more than one is enabled: Groq > Gemini > OpenRouter.
+# (USE_LOCAL_AI overrides all three if set to yes.)
+USE_LOCAL_AI = no
+
+# Set to "no" to fall through to Gemini/OpenRouter below instead of Groq.
+ENABLE_GROQ = yes
+GROQ_API_KEY =
+GROQ_API_KEY_2 =
+GROQ_API_KEY_3 =
+GROQ_API_KEY_4 =
+GROQ_API_KEY_5 =
+GROQ_API_KEY_6 =
+GROQ_API_KEY_7 =
+GROQ_API_KEY_8 =
+GROQ_API_KEY_9 =
+GROQ_API_KEY_10 =
+GROQ_MODEL = openai/gpt-oss-120b
+
+# Google Gemini support. Used only if ENABLE_GROQ = no (or Groq has no keys).
+# Get a free key at: aistudio.google.com/apikey
+ENABLE_GEMINI = no
+GEMINI_API_KEY =
+GEMINI_MODEL = gemini-2.5-flash
+
+# EXPERIMENTAL: OpenRouter support. Lowest priority — used only if both Groq
+# and Gemini are disabled above.
+# (The default model is kind of stupid, so you may want to change it to something else.)
+ENABLE_OPENROUTER = no
+OPENROUTER_API_KEY =
+OPENROUTER_MODEL = nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+
+LOCAL_AI_MODEL =
+LOCAL_AI_TIMEOUT = 30
+ENABLE_COMMAND_EXECUTION = yes
+MEMORY_CHARS = 600
+HISTORY_LIMIT = 6
+FILE_READ_CHARS = 200
+ANIMATION_SPEED = 0.6
+
+# Max tokens generated per AI response. Reasoning models (like the default
+# gpt-oss-120b) spend some of this budget on internal "thinking" before the
+# actual reply, so if responses feel slow or get cut off, raise this.
+MAX_TOKENS = 800
+
+# How hard the model "thinks" before replying. Only applies to reasoning
+# models on Groq (openai/gpt-oss-120b, openai/gpt-oss-20b) — ignored by
+# other models/providers. Lower = faster replies, less careful reasoning.
+# Options: low, medium, high
+REASONING_EFFORT = low
+
+# OCR: capture only the focused/foreground window (yes) or full screen (no)
+OCR_FOCUSED_WINDOW = yes
+
+# FASTER_MODE: removes character awareness and personality details to save tokens.
+# Agetha will respond correctly to commands but with less personality.
+# Set to yes if you are hitting token limits or want faster, cheaper responses.
+FASTER_MODE = no
+"""
+
+# ── Gemini ──────────────────────────────────────────────────────────────────────
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 # ── OpenRouter (EXPERIMENTAL) ──────────────────────────────────────────────────
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -405,27 +584,45 @@ class AIEngine:
         except Exception: self._file_read_chars = 200
         try: self.HISTORY_LIMIT = int(self._config.get("HISTORY_LIMIT", "6"))
         except Exception: pass
+        try: self._max_tokens = int(self._config.get("MAX_TOKENS", str(DEFAULT_MAX_TOKENS)))
+        except Exception: self._max_tokens = DEFAULT_MAX_TOKENS
+
+        reasoning_effort = self._config.get("REASONING_EFFORT", DEFAULT_REASONING_EFFORT).strip().lower()
+        if reasoning_effort not in ("low", "medium", "high"):
+            print(f"[AIEngine] Invalid REASONING_EFFORT '{reasoning_effort}' in config.txt "
+                  f"— falling back to '{DEFAULT_REASONING_EFFORT}'.")
+            reasoning_effort = DEFAULT_REASONING_EFFORT
+        self._reasoning_effort = reasoning_effort
 
         self._command_execution_enabled = self._parse_bool(
             self._config.get("ENABLE_COMMAND_EXECUTION", "yes"), default=True)
         self._use_local_ai = self._parse_bool(self._config.get("USE_LOCAL_AI", "no"), default=False)
         self._use_openrouter = self._parse_bool(self._config.get("ENABLE_OPENROUTER", "no"), default=False)
+        self._use_gemini = self._parse_bool(self._config.get("ENABLE_GEMINI", "no"), default=False)
         self._enable_groq  = self._parse_bool(self._config.get("ENABLE_GROQ", "yes"), default=True)
         self._ocr_focused_window = self._parse_bool(
             self._config.get("OCR_FOCUSED_WINDOW", "yes"), default=True)
 
-        # Priority: local AI > OpenRouter (EXPERIMENTAL) > Groq
+        # Priority: local AI > Groq > Gemini > OpenRouter — only one provider
+        # is ever active, and each stage below wins over everything after it.
         if self._use_local_ai:
             self._enable_groq = False
+            self._use_gemini = False
             self._use_openrouter = False
-        elif self._use_openrouter:
-            self._enable_groq = False
+        elif self._enable_groq:
+            self._use_gemini = False
+            self._use_openrouter = False
+        elif self._use_gemini:
+            self._use_openrouter = False
 
         self._openrouter_key = self._config.get("OPENROUTER_API_KEY", "").strip()
         self._openrouter_model = (self._config.get("OPENROUTER_MODEL", "").strip()
                                    or DEFAULT_OPENROUTER_MODEL)
+        self._gemini_key = self._config.get("GEMINI_API_KEY", "").strip()
+        self._gemini_model = (self._config.get("GEMINI_MODEL", "").strip()
+                               or DEFAULT_GEMINI_MODEL)
 
-        if not GROQ_OK and not self._use_local_ai and not self._use_openrouter:
+        if not GROQ_OK and not self._use_local_ai and not self._use_openrouter and not self._use_gemini:
             self._emit_error("The 'groq' package is not installed.", "Run:  pip install groq", "Then restart Agetha.")
             self._client = None
             return
@@ -437,6 +634,13 @@ class AIEngine:
                 key = self._config.get(key_name, "").strip()
                 if key: self._groq_keys.append(key)
 
+        if self._use_gemini and not self._gemini_key:
+            self._emit_error("ENABLE_GEMINI is set to yes but GEMINI_API_KEY is empty.",
+                             "Open config.txt and add your Gemini API key.",
+                             "Get a free key at: aistudio.google.com/apikey")
+            self._client = None
+            return
+
         if self._use_openrouter and not self._openrouter_key:
             self._emit_error("ENABLE_OPENROUTER is set to yes but OPENROUTER_API_KEY is empty.",
                              "Open config.txt and add a single OpenRouter API key.",
@@ -444,18 +648,15 @@ class AIEngine:
             self._client = None
             return
 
-        if not self._groq_keys and not self._use_local_ai and not self._use_openrouter:
+        if not self._groq_keys and not self._use_local_ai and not self._use_openrouter and not self._use_gemini:
             self._emit_error("No GROQ_API_KEY found in config.txt",
                              "Open config.txt and add at least one Groq API key.",
                              "Get a free key at: console.groq.com")
             self._client = None
             return
 
-        self._current_groq_key_index   = 0
-        self._current_groq_model_index = 0
-        configured_model = self._config.get("GROQ_MODEL", GROQ_MODELS[0]).strip()
-        if configured_model in GROQ_MODELS:
-            self._current_groq_model_index = GROQ_MODELS.index(configured_model)
+        self._current_groq_key_index = 0
+        self._groq_model = self._config.get("GROQ_MODEL", DEFAULT_GROQ_MODEL).strip() or DEFAULT_GROQ_MODEL
 
         self._groq_exhausted = False
         # Token tracking (Groq daily limit: 100,000 TPD)
@@ -548,45 +749,32 @@ class AIEngine:
         return base / CONFIG_FILE_NAME
 
     def _create_default_config(self) -> None:
-        default = """\
-# Agetha v5.0.1 config
-USE_LOCAL_AI = no
-GROQ_API_KEY =
-GROQ_API_KEY_2 =
-GROQ_API_KEY_3 =
-GROQ_API_KEY_4 =
-GROQ_API_KEY_5 =
-GROQ_API_KEY_6 =
-GROQ_API_KEY_7 =
-GROQ_API_KEY_8 =
-GROQ_API_KEY_9 =
-GROQ_API_KEY_10 =
-GROQ_MODEL = llama-3.3-70b-versatile
+        self._config_path.write_text(DEFAULT_CONFIG_TEMPLATE, encoding="utf-8")
 
-# EXPERIMENTAL: OpenRouter support.
-# If enabled, OpenRouter is used and Groq is bypassed entirely.
-# (The default model is kind of stupid, so you may want to change it to something else.)
-ENABLE_OPENROUTER = no
-OPENROUTER_API_KEY =
-OPENROUTER_MODEL = nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+    # ── Config auto-upgrade ─────────────────────────────────────────────────────
+    # Parses DEFAULT_CONFIG_TEMPLATE into a {KEY: value} dict so an existing
+    # config.txt (from before an update) can be diffed against it.
+    @staticmethod
+    def _default_config_pairs() -> dict[str, str]:
+        pairs: dict[str, str] = {}
+        for line in DEFAULT_CONFIG_TEMPLATE.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s:
+                continue
+            k, v = s.split("=", 1)
+            pairs[k.strip().upper()] = v.strip()
+        return pairs
 
-LOCAL_AI_MODEL =
-LOCAL_AI_TIMEOUT = 30
-ENABLE_COMMAND_EXECUTION = yes
-MEMORY_CHARS = 600
-HISTORY_LIMIT = 6
-FILE_READ_CHARS = 200
-ANIMATION_SPEED = 0.6
-
-# OCR: capture only the focused/foreground window (yes) or full screen (no)
-OCR_FOCUSED_WINDOW = yes
-
-# FASTER_MODE: removes character awareness and personality details to save tokens.
-# Agetha will respond correctly to commands but with less personality.
-# Set to yes if you are hitting token limits or want faster, cheaper responses.
-FASTER_MODE = no
-"""
-        self._config_path.write_text(default, encoding="utf-8")
+    def _append_missing_config_keys(self, missing: list[str], defaults: dict[str, str]) -> None:
+        try:
+            lines = ["", "# Auto-added by Agetha — new option(s) introduced in an update:"]
+            for k in missing:
+                lines.append(f"{k} = {defaults[k]}")
+            with self._config_path.open("a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            print(f"[AIEngine] Added missing config option(s) to config.txt: {', '.join(missing)}")
+        except Exception as e:
+            print(f"[AIEngine] Could not update config.txt with new option(s): {e}")
 
     # ── Hardcoded characters data (never needs external characters.txt) ───────────
     _HARDCODED_CHARACTERS = """\
@@ -649,6 +837,17 @@ Daniel: male, messy brown hair, ahoge, blue eyes, yellow hoodie, black pants, fl
             if not s or s.startswith("#") or "=" not in s: continue
             k, v = s.split("=", 1)
             config[k.strip().upper()] = v.strip()
+
+        # Auto-upgrade: any option added to Agetha since this config.txt was
+        # first created (e.g. MAX_TOKENS) gets appended with its default value
+        # instead of silently falling back in memory only, so the user can see
+        # and edit it next time they open config.txt.
+        defaults = self._default_config_pairs()
+        missing = [k for k in defaults if k not in config]
+        if missing:
+            self._append_missing_config_keys(missing, defaults)
+            for k in missing:
+                config[k] = defaults[k]
         return config
 
     @staticmethod
@@ -681,6 +880,17 @@ Daniel: male, messy brown hair, ahoge, blue eyes, yellow hoodie, black pants, fl
                                  "Make sure Ollama is running and the model is installed.")
                 self._client = None; self._fatal_local_ai_error = True; self._show_error_gif = True
             return
+        if self._use_gemini:
+            try:
+                client = _GeminiClient(self._gemini_key, self._gemini_model, timeout=TIMEOUT)
+                class _Wrap:
+                    def __init__(self, c): self.chat = SimpleNamespace(completions=SimpleNamespace(create=c.chat_completions_create))
+                self._client = _Wrap(client)
+                print(f"[AIEngine] Using Gemini model: {self._gemini_model}")
+            except Exception as e:
+                self._emit_error("Failed to initialize Gemini client.", f"Error: {e}")
+                self._client = None
+            return
         if self._use_openrouter:
             try:
                 client = _OpenRouterClient(self._openrouter_key, self._openrouter_model, timeout=TIMEOUT)
@@ -694,20 +904,15 @@ Daniel: male, messy brown hair, ahoge, blue eyes, yellow hoodie, black pants, fl
             return
         if self._enable_groq and self._groq_keys:
             self._client = Groq(api_key=self._groq_keys[self._current_groq_key_index])
-            print(f"[AIEngine] Using Groq/{GROQ_MODELS[self._current_groq_model_index]} "
+            print(f"[AIEngine] Using Groq/{self._groq_model} "
                   f"(Key {self._current_groq_key_index+1}/{len(self._groq_keys)})")
         else:
             self._client = None
 
     def _rotate_key(self) -> bool:
-        nxt_model = self._current_groq_model_index + 1
-        if nxt_model < len(GROQ_MODELS):
-            self._current_groq_model_index = nxt_model
-            self._init_client(); return True
         nxt_key = self._current_groq_key_index + 1
         if nxt_key < len(self._groq_keys):
             self._current_groq_key_index = nxt_key
-            self._current_groq_model_index = 0
             self._init_client(); return True
         return False
 
@@ -850,14 +1055,23 @@ Daniel: male, messy brown hair, ahoge, blue eyes, yellow hoodie, black pants, fl
                 raw = ""
                 if self._use_local_ai:
                     current_model = self._config.get("LOCAL_AI_MODEL", "").strip()
+                elif self._use_gemini:
+                    current_model = self._gemini_model
                 elif self._use_openrouter:
                     current_model = self._openrouter_model
                 else:
-                    current_model = GROQ_MODELS[self._current_groq_model_index]
+                    current_model = self._groq_model
+                # reasoning_effort is only understood by Groq's gpt-oss reasoning
+                # models — other providers/models would error on an unknown param.
+                extra_kwargs = {}
+                if not self._use_local_ai and not self._use_gemini and not self._use_openrouter \
+                        and "gpt-oss" in current_model:
+                    extra_kwargs["reasoning_effort"] = self._reasoning_effort
                 stream = self._client.chat.completions.create(
                     model=current_model,
                     messages=[{"role": "system", "content": system}] + messages,
-                    temperature=0.85, max_tokens=380, top_p=0.95, timeout=TIMEOUT, stream=True,
+                    temperature=0.85, max_tokens=self._max_tokens, top_p=0.95, timeout=TIMEOUT, stream=True,
+                    **extra_kwargs,
                 )
                 
                 # Collect response and track usage if available
@@ -898,17 +1112,20 @@ Daniel: male, messy brown hair, ahoge, blue eyes, yellow hoodie, black pants, fl
             except Exception as e:
                 if self._use_local_ai:
                     provider = f"LocalAI/{self._config.get('LOCAL_AI_MODEL','?')}"
+                elif self._use_gemini:
+                    provider = f"Gemini/{self._gemini_model}"
                 elif self._use_openrouter:
                     provider = f"OpenRouter/{self._openrouter_model}"
                 else:
-                    provider = f"Groq/{GROQ_MODELS[self._current_groq_model_index]}"
+                    provider = f"Groq/{self._groq_model}"
                 print(f"[AIEngine] {provider} error: {e}")
                 errtxt = str(e).lower()
-                # urllib.error.HTTPError (used by the OpenRouter client) is an OSError
-                # subclass but represents a normal HTTP status (401/429/etc), not a
-                # connectivity failure — don't treat it as one.
-                is_openrouter_http_status = self._use_openrouter and hasattr(e, "code") and isinstance(getattr(e, "code", None), int)
-                if not self._use_local_ai and not is_openrouter_http_status and (
+                # urllib.error.HTTPError (used by the Gemini/OpenRouter clients) is
+                # an OSError subclass but represents a normal HTTP status
+                # (401/429/etc), not a connectivity failure — don't treat it as one.
+                is_rest_http_status = (self._use_openrouter or self._use_gemini) and \
+                    hasattr(e, "code") and isinstance(getattr(e, "code", None), int)
+                if not self._use_local_ai and not is_rest_http_status and (
                         isinstance(e, (OSError, ConnectionError, TimeoutError))
                         or "connection" in errtxt or "network" in errtxt):
                     self._show_error_gif = True
@@ -919,8 +1136,28 @@ Daniel: male, messy brown hair, ahoge, blue eyes, yellow hoodie, black pants, fl
                         resp = self._client.chat.completions.create(
                             model=local_model,
                             messages=[{"role": "system", "content": system}] + messages,
-                            temperature=0.85, max_tokens=380, top_p=0.95,
+                            temperature=0.85, max_tokens=self._max_tokens, top_p=0.95,
                             timeout=int(self._config.get("LOCAL_AI_TIMEOUT", TIMEOUT)), stream=False,
+                        )
+                        raw = resp.choices[0].message.content.strip() if hasattr(resp.choices[0], "message") else ""
+                        result = self._parse(raw)
+                        if is_user and result["command"] == "idle":
+                            import random
+                            result.update(command="speak", mood="neutral", segments=random.choice(_IDLE_FALLBACKS))
+                        self._record(user_turn, raw)
+                        return result
+                    except Exception:
+                        pass
+                    return {"command": "idle", "mood": "neutral", "segments": [], "shutdown": False}
+                if self._use_gemini:
+                    # Single key: no rotation available — try once more without
+                    # streaming, then fall back to idle.
+                    try:
+                        resp = self._client.chat.completions.create(
+                            model=self._gemini_model,
+                            messages=[{"role": "system", "content": system}] + messages,
+                            temperature=0.85, max_tokens=self._max_tokens, top_p=0.95,
+                            timeout=TIMEOUT, stream=False,
                         )
                         raw = resp.choices[0].message.content.strip() if hasattr(resp.choices[0], "message") else ""
                         result = self._parse(raw)
@@ -939,7 +1176,7 @@ Daniel: male, messy brown hair, ahoge, blue eyes, yellow hoodie, black pants, fl
                         resp = self._client.chat.completions.create(
                             model=self._openrouter_model,
                             messages=[{"role": "system", "content": system}] + messages,
-                            temperature=0.85, max_tokens=380, top_p=0.95,
+                            temperature=0.85, max_tokens=self._max_tokens, top_p=0.95,
                             timeout=TIMEOUT, stream=False,
                         )
                         raw = resp.choices[0].message.content.strip() if hasattr(resp.choices[0], "message") else ""
