@@ -1,12 +1,12 @@
 """
-Desktop AI Companion — Agetha v5.0.2
+Desktop AI Companion — Agetha v5.0.3
 Requires: pip install pillow pyautogui pytesseract numpy pygame requests pywin32 SpeechRecognition pyaudio
 Assets: idle-1..3.gif, talking-1..3.gif, thinking.gif, sleeping.gif, happy.gif, surprised.gif,
         sad.gif, angry.gif, happy-static.gif, sad-static.gif, angry-static.gif, thinking-static.gif,
         loaf.gif, barrio.ttf (all in assets/ folder)
 """
 
-AGETHA_VERSION = "5.0.2"
+AGETHA_VERSION = "5.0.3"
 # Join the Discord — also linked in the TikTok bio and on the website below.
 DISCORD_INVITE_URL = "https://discord.gg/agetha"
 AGETHA_WEBSITE_URL = "https://chocolatebread.ddns.net/agetha.html"
@@ -1212,7 +1212,7 @@ class CompanionApp:
             self._placeholder_lbl.place(relx=0, rely=0, relwidth=1, relheight=1)
 
     def _get_placeholder_text(self):
-        """Build the placeholder string from current key/token status."""
+        """Build the placeholder string from the current provider and key."""
         try:
             status = self._ai.get_token_status()
             if not status.get("using_groq"):
@@ -1221,8 +1221,7 @@ class CompanionApp:
                 return "local AI  •  type here..."
             idx   = status.get("key_index", 1)
             total = status.get("key_count", 1)
-            pct   = status.get("pct_left", 100)
-            return f"key {idx}/{total}  \u2022  {pct}% tokens left"
+            return f"key {idx}/{total}  \u2022  type here..."
         except Exception:
             return "type here..."
 
@@ -1793,15 +1792,14 @@ class CompanionApp:
             self._talking_rotate_job = None
 
     def _update_token_status(self):
-        """Update status bar with Groq token usage info."""
+        """Update status bar with the active Groq key."""
         try:
             if not self._ai:
                 return
             status = self._ai.get_token_status()
             if status.get("using_groq"):
                 key_info = f"Key {status['key_index']}/{status['key_count']}"
-                pct = status.get("pct_left", 0)
-                self._status_var.set(f"{key_info} | {pct}% left")
+                self._status_var.set(key_info)
             else:
                 # Local AI or no Groq
                 self._status_var.set("")
@@ -2743,7 +2741,7 @@ def _early_config_check():
     if config_path.exists():
         return
 
-    default_config = """# Agetha v5.0.2 config — @tomiszivacs on TikTok
+    default_config = """# Agetha v5.0.3 config — @tomiszivacs on TikTok
 
 # Set to "yes" to use Ollama instead of Groq.
 USE_LOCAL_AI = no
@@ -2752,6 +2750,11 @@ USE_LOCAL_AI = no
 # Much faster — no internet needed. Requires: pip install faster-whisper numpy
 # Downloads a small ~75 MB model (tiny.en) on first run.
 USE_LOCAL_STT = yes
+
+# Only ONE of Groq / Gemini / OpenRouter is ever active at a time.
+# Priority when more than one is enabled: Groq > Gemini > OpenRouter.
+# Set to "no" to fall through to Gemini/OpenRouter below instead of Groq.
+ENABLE_GROQ = yes
 
 # Groq API keys (use separate accounts to avoid rate limits)
 GROQ_API_KEY = 
@@ -2764,10 +2767,16 @@ GROQ_API_KEY_7 =
 GROQ_API_KEY_8 = 
 GROQ_API_KEY_9 = 
 GROQ_API_KEY_10 = 
-GROQ_MODEL = llama-3.3-70b-versatile
+GROQ_MODEL = openai/gpt-oss-120b
+
+# Google Gemini support. Used only if ENABLE_GROQ = no (or Groq has no keys).
+# Get a free key at: aistudio.google.com/apikey
+ENABLE_GEMINI = no
+GEMINI_API_KEY = 
+GEMINI_MODEL = gemini-2.5-flash
 
 # EXPERIMENTAL: OpenRouter support.
-# If enabled, OpenRouter is used and Groq is bypassed entirely.
+# Lowest priority — used only if both Groq and Gemini are disabled above.
 # (The default model is kind of stupid, so you may want to change it to something else.)
 ENABLE_OPENROUTER = no
 OPENROUTER_API_KEY = 
@@ -2784,6 +2793,17 @@ ENABLE_COMMAND_EXECUTION = yes
 MEMORY_CHARS = 600
 HISTORY_LIMIT = 6
 FILE_READ_CHARS = 200
+
+# Max tokens generated per AI response. Reasoning models (like the default
+# gpt-oss-120b) spend some of this budget on internal "thinking" before the
+# actual reply, so if responses feel slow or get cut off, raise this.
+MAX_TOKENS = 800
+
+# How hard the model "thinks" before replying. Only applies to reasoning
+# models on Groq (openai/gpt-oss-120b, openai/gpt-oss-20b) — ignored by
+# other models/providers. Lower = faster replies, less careful reasoning.
+# Options: low, medium, high
+REASONING_EFFORT = low
 
 # GIF animation speed (lower = faster). Default: 0.6
 ANIMATION_SPEED = 0.6
